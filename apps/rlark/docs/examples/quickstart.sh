@@ -56,7 +56,9 @@ ok "Directories created: /tmp/rlark"
 log "Step 2: Starting local Docker registry..."
 docker rm -f local-registry 2>/dev/null || true
 docker run -d --name local-registry --restart=always -p 5555:5000 registry:2
-REGISTRY_IP=$(docker inspect local-registry -f '{{.NetworkSettings.IPAddress}}')
+# FIX(Docker 29): the old top-level .NetworkSettings.IPAddress field is no longer available.
+# Read the container IP from NetworkSettings.Networks instead.
+REGISTRY_IP=$(docker inspect local-registry -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 ok "Local registry: localhost:5555 (IP: $REGISTRY_IP)"
 
 # =============================================================================
@@ -67,21 +69,30 @@ log "Step 3: Building and pushing Docker images..."
 cd "$PROJECT_ROOT/apps/rlark"
 mkdir -p /tmp/rlark-bin
 
-# Build all 5 binaries in parallel
+# Build required binaries in parallel
 GOOS=linux CGO_ENABLED=0 go build -o /tmp/rlark-bin/server ./cmd/server/ &
 GOOS=linux CGO_ENABLED=0 go build -o /tmp/rlark-bin/agent ./cmd/agent/ &
 GOOS=linux CGO_ENABLED=0 go build -o /tmp/rlark-bin/controller-manager ./cmd/controller-manager/ &
 GOOS=linux CGO_ENABLED=0 go build -o /tmp/rlark-bin/gateway ./cmd/gateway/ &
 GOOS=linux CGO_ENABLED=0 go build -o /tmp/rlark-bin/network-sidecar ./cmd/network-sidecar/ &
+# FIX(QuickStart runtime): Task Pods use rlark-tools during initialization,
+# but the original quickstart image did not build or include this binary.
+GOOS=linux CGO_ENABLED=0 go build -o /tmp/rlark-bin/rlark-tools ./cmd/rlark-tools/ &
 wait
 
 cat > /tmp/rlark-bin/Dockerfile <<'DOCKERFILE'
-FROM scratch
+# FIX(QuickStart runtime): the original scratch image has no `cp`,
+# causing rlark-tools-init to fail before Task Pods can start.
+# DaoCloud mirror is used here because Docker Hub timed out in this WSL2 environment.
+# Change back to ubuntu:22.04 if Docker Hub is reachable normally.
+FROM docker.m.daocloud.io/library/ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY server /rlark-server
 COPY agent /rlark-agent
 COPY controller-manager /rlark-controller-manager
 COPY gateway /rlark-gateway
 COPY network-sidecar /usr/local/bin/network-sidecar
+COPY rlark-tools /usr/local/bin/rlark-tools
 DOCKERFILE
 
 docker build -t "$IMAGE" /tmp/rlark-bin
@@ -204,10 +215,20 @@ $(go env GOPATH)/bin/controller-gen crd:maxDescLen=0,allowDangerousTypes=true \
 kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
   apply -f /tmp/rlark/crds/ --validate=false
 
+# FIX(CRD startup race): wait until all RLark CRDs are Established before
+# controller-manager starts. Otherwise it may fail with:
+# "no matches for kind Pod in version rlinf.io/v1alpha1".
+kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
+  wait --for=condition=Established --timeout=60s \
+  -f /tmp/rlark/crds/
+
 # Local quickstart credentials. Production installs use rlarkadm-generated
 # random credentials and must not reuse these ephemeral values.
 ADMIN_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
 USER_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
+# FIX(Auth): current Gateway requires jwt-signing-key in rlark-ui-auth.
+# 32 random bytes are encoded as 64 hexadecimal characters.
+JWT_SIGNING_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
   create namespace default --dry-run=client -o yaml 2>/dev/null | \
   kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard apply --validate=false -f - 2>/dev/null || true
@@ -217,6 +238,7 @@ kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
   create secret generic rlark-ui-auth -n default \
   --from-literal="admin-password=$ADMIN_PASSWORD" \
   --from-literal="user-password=$USER_PASSWORD" \
+  --from-literal="jwt-signing-key=$JWT_SIGNING_KEY" \
   --validate=false
 ok "kubeconfig, DB config, CRDs, and UI credentials ready"
 
@@ -258,7 +280,9 @@ docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d --no-deps --force-recre
 log "Waiting for Gateway..."
 GATEWAY_READY=false
 for i in $(seq 1 30); do
-  if curl -s -o /dev/null -w "%{http_code}" "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" 2>/dev/null | grep -q "200"; then
+  # FIX(Auth readiness): /nodes is now protected by JWT authentication.
+  # HTTP 401 still proves that Gateway and its authentication middleware are running.
+  if curl -s -o /dev/null -w "%{http_code}" "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" 2>/dev/null | grep -Eq "^(200|401)$"; then
     GATEWAY_READY=true
     break
   fi
@@ -315,10 +339,24 @@ ok "All $CLUSTER_COUNT kind cluster(s) ready"
 # =============================================================================
 log "Step 9: Deploying Agents..."
 
+# FIX(Auth): /api/v1/certificates/agent is JWT-protected.
+# Anonymous requests return {"error":"authentication required"}, which previously
+# caused jq to generate invalid PEM files and Agents to enter CrashLoopBackOff.
+# Authenticate with Gateway before requesting protected agent certificates.
+ADMIN_TOKEN=$(curl -sf -X POST "http://localhost:9000/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -nc --arg p "$ADMIN_PASSWORD" '{username:"admin",password:$p}')" | \
+  jq -r '.token')
+
+if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+  err "Failed to obtain Gateway admin JWT"
+fi
+
 # Request agent certificates sequentially (to avoid gateway race conditions)
 for i in $(seq 1 $CLUSTER_COUNT); do
   CID="agent-my-cluster-$i"
-  curl -s -X POST "http://localhost:9000/api/v1/certificates/agent" \
+  curl -sf -X POST "http://localhost:9000/api/v1/certificates/agent" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"cluster_id\":\"${CID}\"}" > "/tmp/rlark/agent-cert-$i.json"
   jq -r .ca_cert "/tmp/rlark/agent-cert-$i.json" > "/tmp/rlark/ca-$i.pem"
@@ -367,11 +405,14 @@ wait
 # Step 10: Verify nodes
 # =============================================================================
 log "Step 10: Verifying node registration..."
+
+# FIX(Auth): the Node API is JWT-protected. Without Authorization, every request
+# returns HTTP 401 and Quick Start incorrectly reports 0 registered nodes.
 for attempt in $(seq 1 30); do
   REGISTERED=0
   for i in $(seq 1 $CLUSTER_COUNT); do
     CID="rlark-agent-my-cluster-$i"
-    if curl -fsS "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" | \
+    if curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" | \
       jq -e --arg cid "$CID" '.items[] | select(.metadata.labels["rlark.io/cluster-id"] == $cid)' >/dev/null; then
       REGISTERED=$((REGISTERED + 1))
     fi
@@ -380,7 +421,7 @@ for attempt in $(seq 1 30); do
   sleep 2
 done
 [ "${REGISTERED:-0}" -eq "$CLUSTER_COUNT" ] || err "Only ${REGISTERED:-0}/$CLUSTER_COUNT expected nodes registered"
-curl -fsS "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" | \
+curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" | \
   jq -r '.items[] | "  \(.metadata.name)  cluster-id=\(.metadata.labels["rlark.io/cluster-id"])"'
 ok "All $CLUSTER_COUNT nodes verified"
 
