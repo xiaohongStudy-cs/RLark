@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+mkdir -p /tmp/rlark
+sudo chown -R "$(id -u):$(id -g)" /tmp/rlark
+chmod 755 /tmp/rlark
 set +H
 
 # =============================================================================
@@ -49,17 +52,22 @@ command -v kubectl >/dev/null 2>&1 || err "kubectl is required"
 command -v jq      >/dev/null 2>&1 || err "jq is required"
 
 # Verify control plane is running
-if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes 2>/dev/null)" != "200" ]; then
+HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+  http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes || true)
+
+if [ -z "$HTTP_CODE" ] || [ "$HTTP_CODE" = "000" ]; then
   err "Control plane not reachable at http://localhost:9000. Run quickstart-cp.sh first."
 fi
+
+log "  Control plane reachable (HTTP $HTTP_CODE)"
 ok "Control plane is reachable"
 
 # Get registry IP
-REGISTRY_IP=$(docker inspect local-registry -f '{{.NetworkSettings.IPAddress}}' 2>/dev/null || echo "")
+REGISTRY_IP=$(docker inspect local-registry -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
 if [ -z "$REGISTRY_IP" ]; then
   warn "Local registry not found, attempting to start..."
   docker run -d --name local-registry --restart=always -p 5555:5000 registry:2
-  REGISTRY_IP=$(docker inspect local-registry -f '{{.NetworkSettings.IPAddress}}')
+  REGISTRY_IP=$(docker inspect local-registry -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 fi
 ok "Local registry: localhost:5555 (IP: $REGISTRY_IP)"
 
@@ -126,10 +134,27 @@ ok "All $CLUSTER_COUNT kind cluster(s) ready"
 # =============================================================================
 log "Step 3: Requesting agent certificates..."
 
+# Gateway certificate API requires admin JWT authentication.
+ADMIN_PASSWORD=$(kubectl --kubeconfig /tmp/rlark/admin.kubeconfig \
+  --context root-shard \
+  get secret rlark-ui-auth -n default \
+  -o jsonpath='{.data.admin-password}' | base64 -d)
+
+ADMIN_TOKEN=$(curl -sf -X POST "http://localhost:9000/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -nc --arg p "$ADMIN_PASSWORD" '{username:"admin",password:$p}')" | \
+  jq -r '.token')
+
+if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+  err "Failed to obtain Gateway admin JWT"
+fi
+
+
 for i in $(seq 1 $CLUSTER_COUNT); do
   CID="${CLUSTER_IDS[$((i-1))]}"
   log "Requesting cert for cluster-id: $CID"
-  curl -s -X POST "http://localhost:9000/api/v1/certificates/agent" \
+  curl -sf -X POST "http://localhost:9000/api/v1/certificates/agent" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"cluster_id\":\"${CID}\"}" > "/tmp/rlark/agent-cert-$i.json"
   jq -r .ca_cert "/tmp/rlark/agent-cert-$i.json" > "/tmp/rlark/ca-$i.pem"

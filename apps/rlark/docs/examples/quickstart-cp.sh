@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+sudo rm -rf /tmp/rlark
+mkdir -p /tmp/rlark
+sudo chown -R "$(id -u):$(id -g)" /tmp/rlark
+chmod 755 /tmp/rlark
 set +H  # disable history expansion (warn/err use !)
 
 # =============================================================================
@@ -65,7 +69,7 @@ ok "Directories created: /tmp/rlark"
 log "Step 2: Starting local Docker registry..."
 docker rm -f local-registry 2>/dev/null || true
 docker run -d --name local-registry --restart=always -p 5555:5000 registry:2
-REGISTRY_IP=$(docker inspect local-registry -f '{{.NetworkSettings.IPAddress}}')
+REGISTRY_IP=$(docker inspect local-registry -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 ok "Local registry: localhost:5555 (IP: $REGISTRY_IP)"
 
 # =============================================================================
@@ -210,17 +214,23 @@ log "  CRDs installed to kcp"
 log "Generating UI credentials..."
 ADMIN_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
 USER_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
+JWT_SIGNING_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+
 kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
   create namespace default --dry-run=client -o yaml 2>/dev/null | \
-  kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard apply --validate=false -f - 2>/dev/null || true
+  kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
+  apply --validate=false -f - 2>/dev/null || true
+
 kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
   delete secret rlark-ui-auth -n default --ignore-not-found 2>/dev/null || true
+
 kubectl --kubeconfig /tmp/rlark/admin.kubeconfig --context root-shard \
   create secret generic rlark-ui-auth -n default \
   --from-literal="admin-password=$ADMIN_PASSWORD" \
   --from-literal="user-password=$USER_PASSWORD" \
-  --validate=false
-ok "kubeconfig, DB config, CRDs, and UI credentials ready"
+  --from-literal="jwt-signing-key=$JWT_SIGNING_KEY"
+
+log "  UI credentials generated"
 
 # =============================================================================
 # Step 6: Start control plane
@@ -259,13 +269,20 @@ docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d --no-deps --force-recre
 log "Waiting for Gateway..."
 GATEWAY_READY=false
 for i in $(seq 1 30); do
-  if curl -s -o /dev/null -w "%{http_code}" "http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes" 2>/dev/null | grep -q "200"; then
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    http://localhost:9000/api/v1/rlinf.io/v1alpha1/nodes || true)
+
+  if [ "$HTTP_CODE" != "000" ] && [ -n "$HTTP_CODE" ]; then
+    log "  Gateway responded with HTTP $HTTP_CODE after $((i*2))s"
     GATEWAY_READY=true
     break
   fi
+
   sleep 2
 done
+
 $GATEWAY_READY || err "Gateway failed to become ready"
+ok "Gateway is ready"
 ok "Control plane is running"
 
 # =============================================================================
